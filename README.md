@@ -1,4 +1,4 @@
-ComplexCalculator
+Calculadora Complexa
 
 Alunos 
 Guilherme Théo Ribeiro Rêgo-Ra:12723111320
