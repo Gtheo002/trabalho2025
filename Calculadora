@@ -1,0 +1,556 @@
+
+import java.io.*;
+import java.util.*;
+import java.util.regex.*;
+
+
+public class ComplexCalculator {
+
+    /* ---------------- Complex number class ---------------- */
+    static class Complex {
+        final double re;
+        final double im;
+        static final double EPS = 1e-12;
+
+        Complex(double re, double im) { this.re = re; this.im = im; }
+
+        static Complex fromReal(double r) { return new Complex(r, 0.0); }
+        static Complex I() { return new Complex(0.0, 1.0); }
+
+        Complex add(Complex o) { return new Complex(re + o.re, im + o.im); }
+        Complex sub(Complex o) { return new Complex(re - o.re, im - o.im); }
+        Complex mul(Complex o) { return new Complex(re*o.re - im*o.im, re*o.im + im*o.re); }
+
+        Complex div(Complex o) {
+            double denom = o.re*o.re + o.im*o.im;
+            if (Math.abs(denom) < EPS) throw new ArithmeticException("Division by zero (complex).");
+            return new Complex((re*o.re + im*o.im)/denom, (im*o.re - re*o.im)/denom);
+        }
+        Complex neg() { return new Complex(-re, -im); }
+        Complex conj() { return new Complex(re, -im); }
+
+        double abs() { return Math.hypot(re, im); }
+        double arg() { return Math.atan2(im, re); }
+
+        Complex exp() {
+            double e = Math.exp(re);
+            return new Complex(e * Math.cos(im), e * Math.sin(im));
+        }
+
+        Complex log() {
+            if (Math.abs(re) < EPS && Math.abs(im) < EPS) throw new ArithmeticException("Log of zero undefined.");
+            return new Complex(Math.log(abs()), arg());
+        }
+
+        Complex pow(Complex exponent) {
+            // z^w = exp(w * log(z))
+            if (Math.abs(re) < EPS && Math.abs(im) < EPS) {
+                if (Math.abs(exponent.re) < EPS && Math.abs(exponent.im) < EPS)
+                    throw new ArithmeticException("0^0 is undefined.");
+                // if Re(w)>0 and small imag -> 0
+                if (exponent.re > 0 && Math.abs(exponent.im) < 1e-10) return new Complex(0,0);
+            }
+            Complex l = this.log();
+            Complex prod = exponent.mul(l);
+            return prod.exp();
+        }
+
+        Complex pow(double n) { return pow(new Complex(n,0)); }
+
+        // principal nth root
+        Complex root(int n) {
+            if (n == 0) throw new ArithmeticException("root(x,0) undefined.");
+            Complex l = this.log();
+            Complex val = l.div(new Complex(n,0)).exp();
+            return val;
+        }
+
+        // convenience
+        Complex sqrt() { return pow(0.5); }
+        Complex ln() { return log(); }
+
+        boolean equalsWithin(Complex other, double tol) {
+            return Math.abs(re - other.re) <= tol && Math.abs(im - other.im) <= tol;
+        }
+
+        @Override
+        public String toString() {
+            String reS = String.format(Locale.ROOT, "%.10g", re);
+            String imS = String.format(Locale.ROOT, "%.10g", Math.abs(im));
+            if (Math.abs(im) < EPS) return reS;
+            if (Math.abs(re) < EPS) {
+                String sign = im < 0 ? "-" : "";
+                String imPart = Math.abs(Math.abs(im) - 1.0) < EPS ? "i" : imS + "i";
+                return sign + imPart;
+            }
+            String sign = im >= 0 ? "+" : "-";
+            String imPart = (Math.abs(Math.abs(im) - 1.0) < EPS ? "i" : imS + "i");
+            return reS + sign + imPart;
+        }
+    }
+
+    /* ---------------- Tokenizer ---------------- */
+    enum TokType {NUMBER, IDENT, I, PLUS, MINUS, MUL, DIV, POW, LPAREN, RPAREN, COMMA, EOF, UNKNOWN}
+    static class Token {
+        TokType type;
+        String text;
+        Token(TokType t, String s){ type=t; text=s; }
+        public String toString(){ return type + ":" + text; }
+    }
+
+    static class Lexer {
+        private final String input;
+        private int pos = 0;
+        private final int n;
+        private static final Pattern numberPattern = Pattern.compile("^([0-9]+(\\.[0-9]+)?)");
+        private static final Pattern identPattern = Pattern.compile("^([A-Za-z_]\\w*)");
+
+        Lexer(String s){ input = s.trim(); n = input.length(); }
+
+        Token next() {
+            while (pos < n && Character.isWhitespace(input.charAt(pos))) pos++;
+            if (pos >= n) return new Token(TokType.EOF, "");
+            char c = input.charAt(pos);
+
+            switch (c) {
+                case '+': pos++; return new Token(TokType.PLUS, "+");
+                case '-': pos++; return new Token(TokType.MINUS, "-");
+                case '*': pos++; return new Token(TokType.MUL, "*");
+                case '/': pos++; return new Token(TokType.DIV, "/");
+                case '^': pos++; return new Token(TokType.POW, "^");
+                case '(': pos++; return new Token(TokType.LPAREN, "(");
+                case ')': pos++; return new Token(TokType.RPAREN, ")");
+                case ',': pos++; return new Token(TokType.COMMA, ",");
+                default:
+                    String rem = input.substring(pos);
+                    Matcher m = numberPattern.matcher(rem);
+                    if (m.find()) {
+                        String num = m.group(1);
+                        pos += num.length();
+                        return new Token(TokType.NUMBER, num);
+                    }
+                    Matcher mi = identPattern.matcher(rem);
+                    if (mi.find()) {
+                        String id = mi.group(1);
+                        pos += id.length();
+                        if (id.equalsIgnoreCase("i")) return new Token(TokType.I, "i");
+                        return new Token(TokType.IDENT, id);
+                    }
+                    pos++;
+                    return new Token(TokType.UNKNOWN, String.valueOf(c));
+            }
+        }
+    }
+
+    /* ---------------- AST ---------------- */
+    interface Node {
+        Complex eval(Map<String, Complex> vars) throws Exception;
+        String toLisp();
+        void collectVariables(Set<String> vars);
+        String toExecutionTree(Map<String, Complex> vars) throws Exception;
+    }
+
+    static class NumberNode implements Node {
+        final Complex value;
+        NumberNode(Complex v){ value = v; }
+        public Complex eval(Map<String, Complex> vars){ return value; }
+        public String toLisp(){ return value.toString(); }
+        public void collectVariables(Set<String> vars) { }
+        public String toExecutionTree(Map<String, Complex> vars){ return value.toString(); }
+    }
+
+    static class VariableNode implements Node {
+        final String name;
+        VariableNode(String n){ name = n; }
+        public Complex eval(Map<String, Complex> vars) {
+            Complex v = vars.get(name);
+            if (v == null) throw new RuntimeException("Variable '" + name + "' not provided.");
+            return v;
+        }
+        public String toLisp(){ return name; }
+        public void collectVariables(Set<String> vars) { vars.add(name); }
+        public String toExecutionTree(Map<String, Complex> vars){
+            Complex v = vars.get(name);
+            return name + " => " + (v==null ? "<no value>" : v.toString());
+        }
+    }
+
+    static class UnaryNode implements Node {
+        final String op; // "neg" or function names like "sqrt","conj"
+        final Node child;
+        UnaryNode(String o, Node c){ op=o; child=c; }
+        public Complex eval(Map<String, Complex> vars) throws Exception {
+            Complex v = child.eval(vars);
+            switch (op) {
+                case "neg": return v.neg();
+                case "sqrt": return v.sqrt();
+                case "conj": return v.conj();
+                case "exp": return v.exp();
+                case "ln": return v.ln();
+                case "abs": return Complex.fromReal(v.abs());
+                default: throw new RuntimeException("Unknown unary operator: " + op);
+            }
+        }
+        public String toLisp(){ return "(" + op + " " + child.toLisp() + ")"; }
+        public void collectVariables(Set<String> vars) { child.collectVariables(vars); }
+        public String toExecutionTree(Map<String, Complex> vars) throws Exception {
+            String childTree = child.toExecutionTree(vars);
+            try {
+                Complex v = eval(vars);
+                return "(" + op + " " + childTree + ") => " + v.toString();
+            } catch (Exception e) {
+                return "(" + op + " " + childTree + ") => ERROR: " + e.getMessage();
+            }
+        }
+    }
+
+    static class BinaryNode implements Node {
+        final String op; // "+", "-", "*", "/", "^"
+        final Node left, right;
+        BinaryNode(String o, Node l, Node r){ op=o; left=l; right=r; }
+        public Complex eval(Map<String, Complex> vars) throws Exception {
+            Complex a = left.eval(vars);
+            Complex b = right.eval(vars);
+            switch (op) {
+                case "+": return a.add(b);
+                case "-": return a.sub(b);
+                case "*": return a.mul(b);
+                case "/": return a.div(b);
+                case "^": return a.pow(b);
+                default: throw new RuntimeException("Unknown binary operator: " + op);
+            }
+        }
+        public String toLisp(){ return "(" + op + " " + left.toLisp() + " " + right.toLisp() + ")"; }
+        public void collectVariables(Set<String> vars) { left.collectVariables(vars); right.collectVariables(vars); }
+        public String toExecutionTree(Map<String, Complex> vars) throws Exception {
+            String L = left.toExecutionTree(vars);
+            String R = right.toExecutionTree(vars);
+            try {
+                Complex v = eval(vars);
+                return "(" + op + " " + L + " " + R + ") => " + v.toString();
+            } catch (Exception e) {
+                return "(" + op + " " + L + " " + R + ") => ERROR: " + e.getMessage();
+            }
+        }
+    }
+
+    static class FuncNode implements Node {
+        final String name;
+        final List<Node> args;
+        FuncNode(String n, List<Node> a){ name=n; args=a; }
+        public Complex eval(Map<String, Complex> vars) throws Exception {
+            String nm = name.toLowerCase(Locale.ROOT);
+            if ("root".equals(nm) || "raiz".equals(nm)) {
+                if (args.size() != 2) throw new RuntimeException("root(x,n) requires 2 arguments.");
+                Complex a0 = args.get(0).eval(vars);
+                Complex a1 = args.get(1).eval(vars);
+                // detect integer index
+                if (Math.abs(a0.im) < Complex.EPS && Math.abs(a0.re - Math.round(a0.re)) < Complex.EPS) {
+                    int n = (int)Math.round(a0.re);
+                    return a1.root(n);
+                } else if (Math.abs(a1.im) < Complex.EPS && Math.abs(a1.re - Math.round(a1.re)) < Complex.EPS) {
+                    int n = (int)Math.round(a1.re);
+                    return a0.root(n);
+                } else throw new RuntimeException("Root index must be an integer real.");
+            } else if ("sqrt".equals(nm)) {
+                if (args.size() != 1) throw new RuntimeException("sqrt(x) requires 1 argument.");
+                return args.get(0).eval(vars).sqrt();
+            } else if ("conj".equals(nm) || "conjugate".equals(nm)) {
+                if (args.size() != 1) throw new RuntimeException(name + "(x) requires 1 argument.");
+                return args.get(0).eval(vars).conj();
+            } else if ("exp".equals(nm)) {
+                if (args.size() != 1) throw new RuntimeException("exp(x) requires 1 argument.");
+                return args.get(0).eval(vars).exp();
+            } else if ("ln".equals(nm) || "log".equals(nm)) {
+                if (args.size() != 1) throw new RuntimeException(name + "(x) requires 1 argument.");
+                return args.get(0).eval(vars).ln();
+            } else if ("abs".equals(nm)) {
+                if (args.size() != 1) throw new RuntimeException("abs(x) requires 1 argument.");
+                return Complex.fromReal(args.get(0).eval(vars).abs());
+            } else {
+                throw new RuntimeException("Unknown function: " + name);
+            }
+        }
+        public String toLisp() {
+            StringBuilder sb = new StringBuilder();
+            sb.append("(").append(name);
+            for (Node a : args) sb.append(" ").append(a.toLisp());
+            sb.append(")");
+            return sb.toString();
+        }
+        public void collectVariables(Set<String> vars) {
+            for (Node a : args) a.collectVariables(vars);
+        }
+        public String toExecutionTree(Map<String, Complex> vars) throws Exception {
+            List<String> argTrees = new ArrayList<>();
+            for (Node a : args) argTrees.add(a.toExecutionTree(vars));
+            try {
+                Complex v = eval(vars);
+                return "(" + name + " " + String.join(" ", argTrees) + ") => " + v.toString();
+            } catch (Exception e) {
+                return "(" + name + " " + String.join(" ", argTrees) + ") => ERROR: " + e.getMessage();
+            }
+        }
+    }
+
+    /* ---------------- Parser ---------------- */
+    static class Parser {
+        private final Lexer lexer;
+        private Token cur;
+
+        Parser(String input) {
+            lexer = new Lexer(input);
+            cur = lexer.next();
+        }
+
+        private void consume() { cur = lexer.next(); }
+
+        private boolean accept(TokType t) {
+            if (cur.type == t) { consume(); return true; }
+            return false;
+        }
+
+        private void expect(TokType t) {
+            if (cur.type != t) throw new RuntimeException("Unexpected token: " + cur + ", expected: " + t);
+            consume();
+        }
+
+        Node parse() {
+            Node expr = parseExpression();
+            if (cur.type != TokType.EOF) throw new RuntimeException("Invalid input after: " + cur.text);
+            return expr;
+        }
+
+        // expr := term (('+'|'-') term)*
+        private Node parseExpression() {
+            Node node = parseTerm();
+            while (cur.type == TokType.PLUS || cur.type == TokType.MINUS) {
+                String op = (cur.type == TokType.PLUS) ? "+" : "-";
+                consume();
+                Node r = parseTerm();
+                node = new BinaryNode(op, node, r);
+            }
+            return node;
+        }
+
+        // term := factor (('*'|'/') factor)*
+        private Node parseTerm() {
+            Node node = parseFactor();
+            while (cur.type == TokType.MUL || cur.type == TokType.DIV) {
+                String op = (cur.type == TokType.MUL) ? "*" : "/";
+                consume();
+                Node r = parseFactor();
+                node = new BinaryNode(op, node, r);
+            }
+            return node;
+        }
+
+        // factor := unary ('^' factor)?
+        private Node parseFactor() {
+            Node node = parseUnary();
+            if (cur.type == TokType.POW) {
+                consume();
+                Node right = parseFactor(); // right-assoc
+                node = new BinaryNode("^", node, right);
+            }
+            return node;
+        }
+
+        // unary := ('+'|'-') unary | primary
+        private Node parseUnary() {
+            if (cur.type == TokType.PLUS) { consume(); return parseUnary(); }
+            if (cur.type == TokType.MINUS) { consume(); Node u = parseUnary(); return new UnaryNode("neg", u); }
+            return parsePrimary();
+        }
+
+        // primary := NUMBER [I]? | I | IDENT '(' args ')' | IDENT | '(' expr ')'
+        private Node parsePrimary() {
+            if (cur.type == TokType.NUMBER) {
+                String num = cur.text;
+                consume();
+                if (cur.type == TokType.I) { consume(); double val = Double.parseDouble(num); return new NumberNode(new Complex(0.0, val)); }
+                else { double val = Double.parseDouble(num); return new NumberNode(new Complex(val, 0.0)); }
+            } else if (cur.type == TokType.I) {
+                consume();
+                return new NumberNode(new Complex(0.0, 1.0));
+            } else if (cur.type == TokType.IDENT) {
+                String id = cur.text;
+                consume();
+                if (cur.type == TokType.LPAREN) {
+                    consume();
+                    List<Node> args = new ArrayList<>();
+                    if (cur.type != TokType.RPAREN) {
+                        args.add(parseExpression());
+                        while (cur.type == TokType.COMMA) { consume(); args.add(parseExpression()); }
+                    }
+                    expect(TokType.RPAREN);
+                    return new FuncNode(id, args);
+                } else {
+                    return new VariableNode(id);
+                }
+            } else if (cur.type == TokType.LPAREN) {
+                consume();
+                Node e = parseExpression();
+                expect(TokType.RPAREN);
+                return e;
+            } else {
+                throw new RuntimeException("Invalid expression, unexpected token: " + cur);
+            }
+        }
+    }
+
+    /* ---------------- Helpers ---------------- */
+    static Node parseExpression(String s) {
+        Parser p = new Parser(s);
+        return p.parse();
+    }
+
+    static Set<String> collectVars(Node root) {
+        Set<String> s = new LinkedHashSet<>();
+        root.collectVariables(s);
+        return s;
+    }
+
+    // Accept forms: a+bi, a-bi, bi, a, i, -i  (spaces allowed)
+    static Complex parseComplexFromString(String raw) {
+        String s = raw.trim().replaceAll("\\s+", "");
+        if (s.equalsIgnoreCase("i")) return new Complex(0,1);
+        if (s.equalsIgnoreCase("-i")) return new Complex(0,-1);
+
+        // if contains 'i' handle imaginary forms
+        if (s.contains("i")) {
+            // normalize standalone i to 1i e.g. +i -> +1i
+            s = s.replaceAll("(?i)(^|(?<=[+\\-]))i", "$11i");
+            // find last + or - (excluding sign at index 0)
+            int idx = Math.max(s.lastIndexOf('+', s.length()-2), s.lastIndexOf('-', s.length()-2));
+            if (idx <= 0) {
+                // pure imag like "3i" or "-2.5i"
+                String imPart = s.replace("i", "");
+                double im = Double.parseDouble(imPart);
+                return new Complex(0.0, im);
+            } else {
+                String rePart = s.substring(0, idx);
+                String imPart = s.substring(idx).replace("i", "");
+                double re = Double.parseDouble(rePart);
+                double im = Double.parseDouble(imPart);
+                return new Complex(re, im);
+            }
+        } else {
+            // pure real
+            double re = Double.parseDouble(s);
+            return new Complex(re, 0);
+        }
+    }
+
+    // numeric equivalence test by random sampling
+    static boolean expressionsEqual(Node a, Node b, int trials, double tol) {
+        Set<String> vars = new LinkedHashSet<>();
+        a.collectVariables(vars);
+        b.collectVariables(vars);
+        Random rnd = new Random(1234567);
+        for (int t=0; t<trials; t++) {
+            Map<String, Complex> env = new HashMap<>();
+            for (String v : vars) {
+                double re = -5 + rnd.nextDouble()*10;
+                double im = -5 + rnd.nextDouble()*10;
+                env.put(v, new Complex(re, im));
+            }
+            try {
+                Complex ra = a.eval(env);
+                Complex rb = b.eval(env);
+                if (!ra.equalsWithin(rb, tol)) return false;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /* ---------------- Main CLI ---------------- */
+    public static void main(String[] args) throws Exception {
+        BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
+        System.out.println("Complex Number Scientific Calculator (CLI)");
+        System.out.println("Commands: :quit, :tree <expr>, :eval <expr>, :equal <e1> ; <e2>");
+        System.out.println("Examples: 3+4i, (1+2i)*(3-i), sqrt(2+3i), conj(1+2i)");
+        while (true) {
+            System.out.print("\n> ");
+            String line = in.readLine();
+            if (line == null) break;
+            line = line.trim();
+            if (line.isEmpty()) continue;
+            if (line.equalsIgnoreCase(":quit") || line.equalsIgnoreCase("quit") || line.equalsIgnoreCase("exit")) {
+                System.out.println("Exiting.");
+                break;
+            }
+            try {
+                if (line.startsWith(":tree")) {
+                    String expr = line.length() > 5 ? line.substring(5).trim() : "";
+                    if (expr.isEmpty()) { System.out.println("Usage: :tree <expression>"); continue; }
+                    Node root = parseExpression(expr);
+                    System.out.println("LISP tree: " + root.toLisp());
+                    continue;
+                } else if (line.startsWith(":eval")) {
+                    String expr = line.length() > 5 ? line.substring(5).trim() : "";
+                    if (expr.isEmpty()) { System.out.println("Usage: :eval <expression>"); continue; }
+                    Node root = parseExpression(expr);
+                    executeNode(root, in);
+                    continue;
+                } else if (line.startsWith(":equal")) {
+                    String exprs = line.length() > 6 ? line.substring(6).trim() : "";
+                    if (exprs.isEmpty()) { System.out.println("Usage: :equal <expr1> ; <expr2>"); continue; }
+                    int semi = exprs.indexOf(';');
+                    if (semi < 0) { System.out.println("Separate expressions with ';'"); continue; }
+                    String e1 = exprs.substring(0, semi).trim();
+                    String e2 = exprs.substring(semi+1).trim();
+                    Node n1 = parseExpression(e1);
+                    Node n2 = parseExpression(e2);
+                    boolean eq = expressionsEqual(n1, n2, 40, 1e-6);
+                    System.out.println(eq ? "Likely EQUAL (numeric test passed)." : "Likely DIFFERENT (numeric test failed).");
+                    continue;
+                } else {
+                    Node root = parseExpression(line);
+                    executeNode(root, in);
+                }
+            } catch (RuntimeException rex) {
+                System.out.println("ERROR: " + rex.getMessage());
+            } catch (Exception ex) {
+                System.out.println("UNEXPECTED ERROR: " + ex.getMessage());
+            }
+        }
+    }
+
+    private static void executeNode(Node root, BufferedReader in) throws Exception {
+        Set<String> vars = collectVars(root);
+        Map<String, Complex> env = new HashMap<>();
+        if (!vars.isEmpty()) {
+            System.out.println("Variables found: " + vars);
+            for (String v : vars) {
+                boolean ok = false;
+                while (!ok) {
+                    System.out.print("Provide value for '" + v + "' (e.g. 3+4i or 2.5 - i): ");
+                    String s = in.readLine();
+                    if (s == null) throw new RuntimeException("Input aborted");
+                    s = s.trim();
+                    try {
+                        Complex c = parseComplexFromString(s);
+                        env.put(v, c);
+                        ok = true;
+                    } catch (Exception e) {
+                        System.out.println("Invalid format: " + e.getMessage());
+                    }
+                }
+            }
+        }
+        try {
+            Complex result = root.eval(env);
+            System.out.println("Result: " + result.toString());
+            System.out.println("LISP tree: " + root.toLisp());
+            System.out.println("Execution tree (values at nodes):");
+            System.out.println(root.toExecutionTree(env));
+        } catch (ArithmeticException ae) {
+            System.out.println("Runtime error: " + ae.getMessage());
+        } catch (Exception e) {
+            System.out.println("Error: " + e.getMessage());
+        }
+    }
+}
